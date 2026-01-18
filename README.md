@@ -45,7 +45,9 @@ $$Output = (K_p \cdot e) + (K_i \cdot \int e) + (K_d \cdot \Delta e) + FeedForwa
 
 The controller listens for standard CAN frames with **ID `0x123`**.
 
-#CAN package structure
+### CAN Package Structure
+
+```cpp
 typedef struct {
   int16_t speed;     // Magnitude (0 to 1000)
   int8_t  direction; // 1 = Forward, 0 = Reverse
