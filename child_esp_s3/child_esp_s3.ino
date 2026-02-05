@@ -1,5 +1,5 @@
 /*
- * ESP32-S3 SLAVE MOTOR CONTROLLER - SMOOTH TYRE RPM WITH NEW PID
+ * ESP32-S3 SLAVE MOTOR CONTROLLER - SMOOTH MOTOR RPM WITH REFACTORED PID
  * Change ONLY: CAN_ID_MOTOR, CAN_ID_FEEDBACK, ENCODER_PPR, GEAR_RATIO, and PID values
  * 
  * FL: CAN_ID_MOTOR=0x124, CAN_ID_FEEDBACK=0x224, ENCODER_PPR=400, GEAR_RATIO=13.7
@@ -27,7 +27,7 @@
 #define MOTOR_OFFSET 13.41
 
 // Motion Profile (Smoothness)
-#define ACCELERATION_STEP 150.0  // Tyre RPM change per control loop (adjust for smoothness)
+#define ACCELERATION_STEP 140.0  // Motor RPM change per control loop (smooth ~1s to full speed)
 // ===========================================================
 
 // ================== RGB LED CONFIG ==================
@@ -66,7 +66,7 @@ Adafruit_NeoPixel statusLed(NUM_PIXELS, RGB_LED_PIN, NEO_GRB + NEO_KHZ800);
 
 // ================== CAN STRUCTS ==================
 typedef struct {
-  float target_rpm;  // Now in TYRE RPM (not motor RPM)
+  float target_rpm;  // Received in TYRE RPM
 } __attribute__((packed)) motor_cmd_t;
 
 typedef struct {
@@ -75,9 +75,9 @@ typedef struct {
 } __attribute__((packed)) motor_feedback_t;
 
 // ================== VARIABLES ==================
-float finalTargetTyreRPM = 0.0;   // Final destination (from CAN)
-float activeTargetTyreRPM = 0.0;  // Moving target (ramped)
-float currentMotorRPM = 0.0;      // Current motor speed
+float finalTargetMotorRPM = 0.0;   // Final destination (converted from CAN)
+float activeTargetMotorRPM = 0.0;  // Moving target (ramped)
+float currentMotorRPM = 0.0;       // Current motor speed
 float filteredMotorRPM = 0.0;
 
 float errorSum = 0.0;
@@ -143,7 +143,7 @@ void setup() {
   statusLed.fill(statusLed.Color(0, 255, 0)); // Green = ready
   statusLed.show();
 
-  Serial.println("✓ Slave Ready - Smooth Tyre RPM Control");
+  Serial.println("✓ Slave Ready - Smooth Motor RPM Control (Refactored)");
 }
 
 // ================== LOOP ==================
@@ -199,8 +199,8 @@ void processCAN() {
     motor_cmd_t cmd;
     memcpy(&cmd, msg.data, sizeof(cmd));
 
-    // Receive TYRE RPM directly
-    finalTargetTyreRPM = cmd.target_rpm;
+    // Receive TYRE RPM and immediately convert to Motor RPM
+    finalTargetMotorRPM = cmd.target_rpm * GEAR_RATIO;
     lastCANUpdate = millis();
   }
 }
@@ -220,7 +220,7 @@ void sendFeedback() {
 
 void checkCANTimeout() {
   if (millis() - lastCANUpdate > CAN_TIMEOUT_MS) {
-    finalTargetTyreRPM = 0;
+    finalTargetMotorRPM = 0;
     canTimeoutDetected = true;
   } else {
     canTimeoutDetected = false;
@@ -287,25 +287,23 @@ float calculateRPM(int16_t count) {
 
 // ================== MOTION PROFILING ==================
 void updateSetpoint() {
-  // Ramp the active target towards final target
-  if (activeTargetTyreRPM < finalTargetTyreRPM) {
-    activeTargetTyreRPM += ACCELERATION_STEP;
-    if (activeTargetTyreRPM > finalTargetTyreRPM) {
-      activeTargetTyreRPM = finalTargetTyreRPM;
+  // Ramp the active target towards final target (now in Motor RPM)
+  if (activeTargetMotorRPM < finalTargetMotorRPM) {
+    activeTargetMotorRPM += ACCELERATION_STEP;
+    if (activeTargetMotorRPM > finalTargetMotorRPM) {
+      activeTargetMotorRPM = finalTargetMotorRPM;
     }
-  } else if (activeTargetTyreRPM > finalTargetTyreRPM) {
-    activeTargetTyreRPM -= ACCELERATION_STEP;
-    if (activeTargetTyreRPM < finalTargetTyreRPM) {
-      activeTargetTyreRPM = finalTargetTyreRPM;
+  } else if (activeTargetMotorRPM > finalTargetMotorRPM) {
+    activeTargetMotorRPM -= ACCELERATION_STEP;
+    if (activeTargetMotorRPM < finalTargetMotorRPM) {
+      activeTargetMotorRPM = finalTargetMotorRPM;
     }
   }
 }
 
 // ================== PID ==================
 void runPID() {
-  // Convert active tyre target to motor RPM for PID
-  float activeTargetMotorRPM = activeTargetTyreRPM * GEAR_RATIO;
-  
+  // Calculate error directly in Motor RPM
   float error = activeTargetMotorRPM - currentMotorRPM;
 
   // Stop condition - RESET integral when stopped
@@ -327,7 +325,8 @@ void runPID() {
   float futureI = KI * proposedErrorSum;
   float dTermCheck = KD * ((error - lastError) / (CONTROL_LOOP_TIME_MS / 1000.0));
   
-  // Feedforward
+  // Feedforward - Convert to Tyre RPM for the model
+  float activeTargetTyreRPM = activeTargetMotorRPM / GEAR_RATIO;
   float absTargetTyre = fabs(activeTargetTyreRPM);
   float ffMag = (absTargetTyre > 0.1) ? ((absTargetTyre / MOTOR_GAIN) + MOTOR_OFFSET) : 0;
   float ff = (activeTargetMotorRPM >= 0) ? ffMag : -ffMag;
@@ -381,7 +380,7 @@ void updateLED() {
   if (canTimeoutDetected) {
     // Solid MAGENTA = No CAN commands
     color = statusLed.Color(255, 0, 255);
-  } else if (fabs(finalTargetTyreRPM) > 0.1) {
+  } else if (fabs(finalTargetMotorRPM) > 0.1) {
     // Solid BLUE = Motor running
     color = statusLed.Color(0, 0, 255);
   } else {

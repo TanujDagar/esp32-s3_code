@@ -1,6 +1,6 @@
 /*
- * ESP32-S3 FRONT LEFT - MASTER + SLAVE WITH SMOOTH TYRE RPM CONTROL
- * - Controls its own motor (FL) with smooth ramping
+ * ESP32-S3 FRONT LEFT - MASTER + SLAVE WITH SMOOTH MOTOR RPM CONTROL (REFACTORED)
+ * - Controls its own motor (FL) with smooth ramping on Motor RPM scale
  * - Receives UART commands from Jetson (rad/s)
  * - Sends CAN commands to other 3 slaves (tyre RPM)
  * - Shows clear status via RGB LEDs
@@ -52,7 +52,7 @@
 #define MOTOR_OFFSET 13.41
 
 // Motion Profile
-#define ACCELERATION_STEP 150.0  // Tyre RPM change per control loop
+#define ACCELERATION_STEP 140.0  // Motor RPM change per control loop (~1s to full speed)
 
 // ================== CONTROL PARAMS ==================
 #define PWM_FREQ             25000
@@ -107,9 +107,9 @@ typedef struct {
 // ================== GLOBALS ==================
 Adafruit_NeoPixel statusLed(NUM_PIXELS, RGB_LED_PIN, NEO_GRB + NEO_KHZ800);
 
-// My motor state
-float myFinalTargetTyreRPM = 0.0;    // Final destination
-float myActiveTargetTyreRPM = 0.0;   // Moving target (ramped)
+// My motor state - NOW IN MOTOR RPM
+float myFinalTargetMotorRPM = 0.0;    // Final destination (Motor RPM)
+float myActiveTargetMotorRPM = 0.0;   // Moving target (ramped, Motor RPM)
 float myCurrentMotorRPM = 0.0;
 float myFilteredMotorRPM = 0.0;
 int myCurrentPWM = 0;
@@ -168,7 +168,7 @@ void setup() {
 
   Serial.begin(115200);
   delay(500);
-  Serial.println("\n=== ESP32-S3 Front Left Master - Smooth Control ===");
+  Serial.println("\n=== ESP32-S3 Front Left Master - Smooth Motor Control (Refactored) ===");
 
   statusLed.begin();
   statusLed.setBrightness(LED_BRIGHTNESS);
@@ -230,7 +230,7 @@ void loop() {
       Serial.println("WARNING: UART timeout - stopping motors");
       uartConnected = false;
     }
-    myFinalTargetTyreRPM = 0;
+    myFinalTargetMotorRPM = 0;
     sendCANCommand(CAN_ID_FR, 0.0);
     sendCANCommand(CAN_ID_BR, 0.0);
     sendCANCommand(CAN_ID_BL, 0.0);
@@ -241,7 +241,7 @@ void loop() {
     }
   }
 
-  motorsActive = (fabs(myFinalTargetTyreRPM) > 0.1);
+  motorsActive = (fabs(myFinalTargetMotorRPM) > 0.1);
 
   if (now - lastRPMTime >= RPM_SAMPLE_TIME_MS) {
     measureMyRPM();
@@ -305,7 +305,7 @@ void processUARTCommands() {
             
             lastUartCmdTime = millis();
 
-            // Convert rad/s to tyre RPM and send to CAN slaves
+            // Convert rad/s to tyre RPM and send to CAN slaves (UNCHANGED)
             float fr_tyre_rpm = cmd.fr_vel * RADS_TO_RPM;
             float rr_tyre_rpm = cmd.rr_vel * RADS_TO_RPM;
             float rl_tyre_rpm = cmd.rl_vel * RADS_TO_RPM;
@@ -314,8 +314,8 @@ void processUARTCommands() {
             sendCANCommand(CAN_ID_BR, rr_tyre_rpm);
             sendCANCommand(CAN_ID_BL, rl_tyre_rpm);
 
-            // Set my own final target (convert rad/s to tyre RPM)
-            myFinalTargetTyreRPM = cmd.fl_vel * RADS_TO_RPM;
+            // Set my own final target - Convert rad/s directly to MOTOR RPM
+            myFinalTargetMotorRPM = cmd.fl_vel * RADS_TO_RPM * GEAR_RATIO;
 
             if (fabs(cmd.fl_vel) > 0.01 || fabs(cmd.fr_vel) > 0.01) {
               Serial.printf("CMD: FL=%.2f RL=%.2f FR=%.2f RR=%.2f rad/s\n", 
@@ -342,7 +342,7 @@ void sendUARTFeedback() {
   SerialFeedback fb;
   fb.header = 0xA5;
 
-  // My motor (Front Left) - send tyre velocity
+  // My motor (Front Left) - convert motor RPM to tyre velocity (rad/s)
   fb.fl_pos = myEncoderTicks * TICKS_TO_RAD;
   fb.fl_vel = (myCurrentMotorRPM / GEAR_RATIO) * RPM_TO_RADS;
 
@@ -476,28 +476,26 @@ float calculateRPM(int16_t delta) {
 }
 
 void updateMySetpoint() {
-  // Ramp the active target towards final target
-  if (myActiveTargetTyreRPM < myFinalTargetTyreRPM) {
-    myActiveTargetTyreRPM += ACCELERATION_STEP;
-    if (myActiveTargetTyreRPM > myFinalTargetTyreRPM) {
-      myActiveTargetTyreRPM = myFinalTargetTyreRPM;
+  // Ramp the active target towards final target (now in Motor RPM)
+  if (myActiveTargetMotorRPM < myFinalTargetMotorRPM) {
+    myActiveTargetMotorRPM += ACCELERATION_STEP;
+    if (myActiveTargetMotorRPM > myFinalTargetMotorRPM) {
+      myActiveTargetMotorRPM = myFinalTargetMotorRPM;
     }
-  } else if (myActiveTargetTyreRPM > myFinalTargetTyreRPM) {
-    myActiveTargetTyreRPM -= ACCELERATION_STEP;
-    if (myActiveTargetTyreRPM < myFinalTargetTyreRPM) {
-      myActiveTargetTyreRPM = myFinalTargetTyreRPM;
+  } else if (myActiveTargetMotorRPM > myFinalTargetMotorRPM) {
+    myActiveTargetMotorRPM -= ACCELERATION_STEP;
+    if (myActiveTargetMotorRPM < myFinalTargetMotorRPM) {
+      myActiveTargetMotorRPM = myFinalTargetMotorRPM;
     }
   }
 }
 
 void runMyPID() {
-  // Convert active tyre target to motor RPM for PID
-  float activeTargetMotorRPM = myActiveTargetTyreRPM * GEAR_RATIO;
-  
-  float error = activeTargetMotorRPM - myCurrentMotorRPM;
+  // Calculate error directly in Motor RPM
+  float error = myActiveTargetMotorRPM - myCurrentMotorRPM;
 
   // Stop condition
-  if (fabs(activeTargetMotorRPM) < 0.1 && fabs(myCurrentMotorRPM) < 5.0) {
+  if (fabs(myActiveTargetMotorRPM) < 0.1 && fabs(myCurrentMotorRPM) < 5.0) {
     ledcWrite(PWM_PIN, 0);
     myCurrentPWM = 0;
     myErrorSum = 0;
@@ -515,10 +513,11 @@ void runMyPID() {
   float futureI = KI * proposedErrorSum;
   float dTermCheck = KD * ((error - myLastError) / (CONTROL_LOOP_TIME_MS / 1000.0));
   
-  // Feedforward
+  // Feedforward - Convert to Tyre RPM for the model
+  float myActiveTargetTyreRPM = myActiveTargetMotorRPM / GEAR_RATIO;
   float absTargetTyre = fabs(myActiveTargetTyreRPM);
   float ffMag = (absTargetTyre > 0.1) ? ((absTargetTyre / MOTOR_GAIN) + MOTOR_OFFSET) : 0;
-  float ff = (activeTargetMotorRPM >= 0) ? ffMag : -ffMag;
+  float ff = (myActiveTargetMotorRPM >= 0) ? ffMag : -ffMag;
   
   float estimatedOutput = pTerm + futureI + dTermCheck + ff;
   
